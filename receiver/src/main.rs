@@ -8,6 +8,7 @@ use std::net::UdpSocket;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -128,6 +129,8 @@ impl ReceiverApp {
                 self.height = img_height;
                 self.current_image = Some(pixels);
                 if let Some(window) = &self.window {
+                    let logical_size = LogicalSize::new(img_width as f64, img_height as f64);
+                    let _ = window.request_inner_size(logical_size);
                     window.request_redraw();
                 }
             }
@@ -141,10 +144,17 @@ impl ReceiverApp {
         let Some(pixels) = self.current_image.as_ref() else {
             return;
         };
-        let Some(width_nz) = NonZeroU32::new(self.width) else {
+        let Some(window) = self.window.as_ref() else {
             return;
         };
-        let Some(height_nz) = NonZeroU32::new(self.height) else {
+        let window_size = window.inner_size();
+        if window_size.width == 0 || window_size.height == 0 {
+            return;
+        }
+        let Some(width_nz) = NonZeroU32::new(window_size.width) else {
+            return;
+        };
+        let Some(height_nz) = NonZeroU32::new(window_size.height) else {
             return;
         };
 
@@ -153,11 +163,25 @@ impl ReceiverApp {
         }
 
         if let Ok(mut buffer) = surface.buffer_mut() {
-            if buffer.len() == pixels.len() {
+            let dst_width = window_size.width as usize;
+            let dst_height = window_size.height as usize;
+            let src_width = self.width as usize;
+            let src_height = self.height as usize;
+
+            if buffer.len() == pixels.len() && dst_width == src_width && dst_height == src_height {
                 buffer.copy_from_slice(pixels);
+            } else if src_width == 0 || src_height == 0 {
+                return;
             } else {
-                let min_len = buffer.len().min(pixels.len());
-                buffer[..min_len].copy_from_slice(&pixels[..min_len]);
+                for y in 0..dst_height {
+                    let src_y = (y * src_height) / dst_height;
+                    let src_row = src_y * src_width;
+                    let dst_row = y * dst_width;
+                    for x in 0..dst_width {
+                        let src_x = (x * src_width) / dst_width;
+                        buffer[dst_row + x] = pixels[src_row + src_x];
+                    }
+                }
             }
             let _ = buffer.present();
         }
