@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CHUNK_SIZE: usize = 60_000; // each UDP packet payload size (<= 65KB)
+const CHUNK_SIZE: usize = 1_200; // keep under typical MTU to avoid fragmentation
 
 fn main() {
     // Get receiver IP from args
