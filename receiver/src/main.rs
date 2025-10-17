@@ -95,6 +95,7 @@ impl ReceiverApp {
     fn drain_socket(&mut self) {
         while let Ok((len, _src)) = self.socket.recv_from(&mut self.buf) {
             if len < 8 {
+                eprintln!("Discarded packet smaller than header (len={len})");
                 continue;
             }
 
@@ -109,6 +110,12 @@ impl ReceiverApp {
             });
             frame.chunks.insert(chunk_index, data.to_vec());
 
+            if frame.chunks.len() == 1 {
+                println!(
+                    "Started frame {frame_id} (expecting {total_chunks} chunks, first chunk {chunk_index})"
+                );
+            }
+
             if frame.chunks.len() as u16 == frame.total_chunks {
                 let mut jpeg_data = Vec::new();
                 for i in 0..frame.total_chunks {
@@ -116,9 +123,16 @@ impl ReceiverApp {
                         jpeg_data.extend_from_slice(chunk);
                     }
                 }
+                println!(
+                    "Frame {frame_id} assembled with {} chunks ({} bytes total)",
+                    frame.total_chunks,
+                    jpeg_data.len()
+                );
 
                 if let Ok(decoder) = JpegDecoder::new(Cursor::new(jpeg_data)) {
                     self.handle_decoded_frame(decoder);
+                } else {
+                    eprintln!("Failed to create JPEG decoder for frame {frame_id}");
                 }
 
                 self.frames.remove(&frame_id);
@@ -141,12 +155,17 @@ impl ReceiverApp {
                 self.height = img_height;
                 self.current_image = Some(pixels);
                 self.frame_dirty = true;
+                println!("Decoded frame: {img_width}x{img_height} ({:?})", color_type);
                 if let Some(window) = &self.window {
                     let logical_size = LogicalSize::new(img_width as f64, img_height as f64);
                     let _ = window.request_inner_size(logical_size);
                     window.request_redraw();
                 }
+            } else {
+                eprintln!("Unsupported color type {color_type:?}, frame dropped");
             }
+        } else {
+            eprintln!("Failed reading pixels for frame {img_width}x{img_height}");
         }
     }
 
