@@ -109,18 +109,28 @@ impl ReceiverApp {
                 total_chunks,
             });
             frame.chunks.insert(chunk_index, data.to_vec());
+            let stored_chunks = frame.chunks.len();
 
-            if frame.chunks.len() == 1 {
+            println!(
+                "Frame {frame_id}: stored chunk {chunk_index}/{} (have {stored_chunks}/{total_chunks})",
+                total_chunks.saturating_sub(1)
+            );
+
+            if stored_chunks == 1 {
                 println!(
                     "Started frame {frame_id} (expecting {total_chunks} chunks, first chunk {chunk_index})"
                 );
             }
 
-            if frame.chunks.len() as u16 == frame.total_chunks {
+            if stored_chunks as u16 == frame.total_chunks {
                 let mut jpeg_data = Vec::new();
                 for i in 0..frame.total_chunks {
                     if let Some(chunk) = frame.chunks.get(&i) {
                         jpeg_data.extend_from_slice(chunk);
+                    } else {
+                        eprintln!(
+                            "Frame {frame_id} missing chunk {i}, assembled data may be incomplete"
+                        );
                     }
                 }
                 println!(
@@ -191,6 +201,10 @@ impl ReceiverApp {
         };
 
         if surface.resize(width_nz, height_nz).is_err() {
+            eprintln!(
+                "Surface resize failed for window size {}x{}",
+                window_size.width, window_size.height
+            );
             return;
         }
 
@@ -200,11 +214,25 @@ impl ReceiverApp {
             let src_width = self.width as usize;
             let src_height = self.height as usize;
 
+            println!(
+                "Rendering frame {}x{} into buffer {}x{} (buffer len {}, pixels len {})",
+                src_width,
+                src_height,
+                dst_width,
+                dst_height,
+                buffer.len(),
+                pixels.len()
+            );
+
             if buffer.len() == pixels.len() && dst_width == src_width && dst_height == src_height {
                 buffer.copy_from_slice(pixels);
             } else if src_width == 0 || src_height == 0 {
                 return;
             } else {
+                println!(
+                    "Scaling frame {}x{} -> {}x{}",
+                    src_width, src_height, dst_width, dst_height
+                );
                 for y in 0..dst_height {
                     let src_y = (y * src_height) / dst_height;
                     let src_row = src_y * src_width;
@@ -217,6 +245,10 @@ impl ReceiverApp {
             }
             let _ = buffer.present();
             self.frame_dirty = false;
+            println!(
+                "Presented frame (source {}x{}, window {}x{})",
+                src_width, src_height, dst_width, dst_height
+            );
         }
     }
 }
