@@ -90,10 +90,10 @@ impl ReceiverApp {
             let total_chunks = u16::from_be_bytes(self.buf[6..8].try_into().unwrap());
             let data = &self.buf[8..len];
 
-            let frame =
-                self.frames
-                    .entry(frame_id)
-                    .or_insert_with(|| FrameBuffer { chunks: HashMap::new(), total_chunks });
+            let frame = self.frames.entry(frame_id).or_insert_with(|| FrameBuffer {
+                chunks: HashMap::new(),
+                total_chunks,
+            });
             frame.chunks.insert(chunk_index, data.to_vec());
 
             if frame.chunks.len() as u16 == frame.total_chunks {
@@ -219,28 +219,33 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = ReceiverApp::new(socket);
 
-    event_loop
-        .run_app(&mut app)
-        .expect("event loop run failed");
+    event_loop.run_app(&mut app).expect("event loop run failed");
 }
 
 fn convert_to_pixels(raw: &[u8], color_type: ColorType) -> Option<Vec<u32>> {
     match color_type {
         ColorType::Rgb8 => Some(
             raw.chunks_exact(3)
-                .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+                .map(|p| {
+                    0xFF_00_0000 | ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)
+                })
                 .collect(),
         ),
         ColorType::Rgba8 => Some(
             raw.chunks_exact(4)
-                .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+                .map(|p| {
+                    ((p[3] as u32) << 24)
+                        | ((p[0] as u32) << 16)
+                        | ((p[1] as u32) << 8)
+                        | (p[2] as u32)
+                })
                 .collect(),
         ),
         ColorType::L8 => Some(
             raw.iter()
                 .map(|&v| {
                     let v = v as u32;
-                    (v << 16) | (v << 8) | v
+                    0xFF_00_0000 | (v << 16) | (v << 8) | v
                 })
                 .collect(),
         ),
