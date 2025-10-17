@@ -60,6 +60,15 @@ impl ReceiverApp {
                         Ok(surface) => {
                             self.render_target = Some((context, surface));
                             self.window = Some(window_rc.clone());
+                            let placeholder_len =
+                                (self.width as usize).saturating_mul(self.height as usize);
+                            if placeholder_len > 0 {
+                                self.current_image = Some(vec![0xFF_00_0000; placeholder_len]);
+                            }
+                            let _ = window_rc.request_inner_size(LogicalSize::new(
+                                self.width as f64,
+                                self.height as f64,
+                            ));
                             window_rc.request_redraw();
                         }
                         Err(err) => {
@@ -219,6 +228,7 @@ impl ApplicationHandler<()> for ReceiverApp {
         }
 
         match event {
+            WindowEvent::Resized(_size) => window.request_redraw(),
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::CloseRequested => event_loop.exit(),
             _ => {}
