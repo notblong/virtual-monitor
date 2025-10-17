@@ -1,0 +1,249 @@
+use image::codecs::jpeg::JpegDecoder;
+use image::{ColorType, ImageDecoder};
+use softbuffer::{Context, Surface};
+use std::collections::HashMap;
+use std::convert::TryInto;
+use std::io::Cursor;
+use std::net::UdpSocket;
+use std::num::NonZeroU32;
+use std::rc::Rc;
+use winit::application::ApplicationHandler;
+use winit::event::{StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Window, WindowAttributes, WindowId};
+
+struct FrameBuffer {
+    chunks: HashMap<u16, Vec<u8>>,
+    total_chunks: u16,
+}
+
+struct ReceiverApp {
+    socket: UdpSocket,
+    frames: HashMap<u32, FrameBuffer>,
+    buf: [u8; 65_507],
+    window_attributes: WindowAttributes,
+    window: Option<Rc<Window>>,
+    render_target: Option<(Context<Rc<Window>>, Surface<Rc<Window>, Rc<Window>>)>,
+    current_image: Option<Vec<u32>>,
+    width: u32,
+    height: u32,
+}
+
+impl ReceiverApp {
+    fn new(socket: UdpSocket) -> Self {
+        let window_attributes =
+            Window::default_attributes().with_title("Rust Screen Mirror Receiver");
+        Self {
+            socket,
+            frames: HashMap::new(),
+            buf: [0u8; 65_507],
+            window_attributes,
+            window: None,
+            render_target: None,
+            current_image: None,
+            width: 800,
+            height: 600,
+        }
+    }
+
+    fn ensure_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        match event_loop.create_window(self.window_attributes.clone()) {
+            Ok(new_window) => {
+                let window_rc = Rc::new(new_window);
+                match Context::new(window_rc.clone()) {
+                    Ok(context) => match Surface::new(&context, window_rc.clone()) {
+                        Ok(surface) => {
+                            self.render_target = Some((context, surface));
+                            self.window = Some(window_rc.clone());
+                            window_rc.request_redraw();
+                        }
+                        Err(err) => {
+                            eprintln!("Surface creation failed: {err}");
+                            event_loop.exit();
+                        }
+                    },
+                    Err(err) => {
+                        eprintln!("Context creation failed: {err}");
+                        event_loop.exit();
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("Window creation failed: {err}");
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn drain_socket(&mut self) {
+        while let Ok((len, _src)) = self.socket.recv_from(&mut self.buf) {
+            if len < 8 {
+                continue;
+            }
+
+            let frame_id = u32::from_be_bytes(self.buf[0..4].try_into().unwrap());
+            let chunk_index = u16::from_be_bytes(self.buf[4..6].try_into().unwrap());
+            let total_chunks = u16::from_be_bytes(self.buf[6..8].try_into().unwrap());
+            let data = &self.buf[8..len];
+
+            let frame =
+                self.frames
+                    .entry(frame_id)
+                    .or_insert_with(|| FrameBuffer { chunks: HashMap::new(), total_chunks });
+            frame.chunks.insert(chunk_index, data.to_vec());
+
+            if frame.chunks.len() as u16 == frame.total_chunks {
+                let mut jpeg_data = Vec::new();
+                for i in 0..frame.total_chunks {
+                    if let Some(chunk) = frame.chunks.get(&i) {
+                        jpeg_data.extend_from_slice(chunk);
+                    }
+                }
+
+                if let Ok(decoder) = JpegDecoder::new(Cursor::new(jpeg_data)) {
+                    self.handle_decoded_frame(decoder);
+                }
+
+                self.frames.remove(&frame_id);
+            }
+        }
+    }
+
+    fn handle_decoded_frame<D>(&mut self, decoder: D)
+    where
+        D: ImageDecoder,
+    {
+        let (img_width, img_height) = decoder.dimensions();
+        let color_type = decoder.color_type();
+        let bytes_per_pixel = color_type.bytes_per_pixel() as usize;
+        let mut raw = vec![0; img_width as usize * img_height as usize * bytes_per_pixel];
+
+        if decoder.read_image(&mut raw).is_ok() {
+            if let Some(pixels) = convert_to_pixels(&raw, color_type) {
+                self.width = img_width;
+                self.height = img_height;
+                self.current_image = Some(pixels);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn render(&mut self) {
+        let Some((_, surface)) = self.render_target.as_mut() else {
+            return;
+        };
+        let Some(pixels) = self.current_image.as_ref() else {
+            return;
+        };
+        let Some(width_nz) = NonZeroU32::new(self.width) else {
+            return;
+        };
+        let Some(height_nz) = NonZeroU32::new(self.height) else {
+            return;
+        };
+
+        if surface.resize(width_nz, height_nz).is_err() {
+            return;
+        }
+
+        if let Ok(mut buffer) = surface.buffer_mut() {
+            if buffer.len() == pixels.len() {
+                buffer.copy_from_slice(pixels);
+            } else {
+                let min_len = buffer.len().min(pixels.len());
+                buffer[..min_len].copy_from_slice(&pixels[..min_len]);
+            }
+            let _ = buffer.present();
+        }
+    }
+}
+
+impl ApplicationHandler<()> for ReceiverApp {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::Init) {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            self.ensure_window(event_loop);
+        }
+        self.drain_socket();
+    }
+
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.ensure_window(event_loop);
+        self.drain_socket();
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        self.drain_socket();
+
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        if window_id != window.id() {
+            return;
+        }
+
+        match event {
+            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::CloseRequested => event_loop.exit(),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        self.drain_socket();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
+fn main() {
+    let socket = UdpSocket::bind("0.0.0.0:5000").expect("bind failed");
+    socket
+        .set_nonblocking(true)
+        .expect("failed to set nonblocking");
+    println!("Listening on UDP port 5000...");
+
+    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let mut app = ReceiverApp::new(socket);
+
+    event_loop
+        .run_app(&mut app)
+        .expect("event loop run failed");
+}
+
+fn convert_to_pixels(raw: &[u8], color_type: ColorType) -> Option<Vec<u32>> {
+    match color_type {
+        ColorType::Rgb8 => Some(
+            raw.chunks_exact(3)
+                .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+                .collect(),
+        ),
+        ColorType::Rgba8 => Some(
+            raw.chunks_exact(4)
+                .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+                .collect(),
+        ),
+        ColorType::L8 => Some(
+            raw.iter()
+                .map(|&v| {
+                    let v = v as u32;
+                    (v << 16) | (v << 8) | v
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
