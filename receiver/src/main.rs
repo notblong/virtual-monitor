@@ -28,6 +28,7 @@ struct ReceiverApp {
     current_image: Option<Vec<u32>>,
     width: u32,
     height: u32,
+    frame_dirty: bool,
 }
 
 impl ReceiverApp {
@@ -44,6 +45,7 @@ impl ReceiverApp {
             current_image: None,
             width: 800,
             height: 600,
+            frame_dirty: false,
         }
     }
 
@@ -64,6 +66,7 @@ impl ReceiverApp {
                                 (self.width as usize).saturating_mul(self.height as usize);
                             if placeholder_len > 0 {
                                 self.current_image = Some(vec![0xFF_00_0000; placeholder_len]);
+                                self.frame_dirty = true;
                             }
                             let _ = window_rc.request_inner_size(LogicalSize::new(
                                 self.width as f64,
@@ -137,6 +140,7 @@ impl ReceiverApp {
                 self.width = img_width;
                 self.height = img_height;
                 self.current_image = Some(pixels);
+                self.frame_dirty = true;
                 if let Some(window) = &self.window {
                     let logical_size = LogicalSize::new(img_width as f64, img_height as f64);
                     let _ = window.request_inner_size(logical_size);
@@ -193,6 +197,7 @@ impl ReceiverApp {
                 }
             }
             let _ = buffer.present();
+            self.frame_dirty = false;
         }
     }
 }
@@ -228,7 +233,10 @@ impl ApplicationHandler<()> for ReceiverApp {
         }
 
         match event {
-            WindowEvent::Resized(_size) => window.request_redraw(),
+            WindowEvent::Resized(_size) => {
+                self.frame_dirty = true;
+                window.request_redraw();
+            }
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::CloseRequested => event_loop.exit(),
             _ => {}
@@ -237,8 +245,10 @@ impl ApplicationHandler<()> for ReceiverApp {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         self.drain_socket();
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if self.frame_dirty {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 }
