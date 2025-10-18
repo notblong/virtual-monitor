@@ -11,8 +11,8 @@ use std::{
 };
 
 const CHUNK_SIZE: usize = 1_200; // keep under typical MTU to avoid fragmentation
-const DEFAULT_MAX_FRAME_WIDTH: u32 = 1_280;
-const DEFAULT_MAX_FRAME_HEIGHT: u32 = 720;
+const DEFAULT_MAX_FRAME_WIDTH: u32 = 960;
+const DEFAULT_MAX_FRAME_HEIGHT: u32 = 540;
 const DEFAULT_MAX_FPS: f32 = 30.0;
 const DEFAULT_JPEG_QUALITY: u8 = 60;
 const DEFAULT_RECEIVER_IP: &str = "127.0.0.1";
@@ -21,8 +21,8 @@ Usage: sender [options] [receiver_ip]
 
 Options:
   --receiver <ip>          Receiver IPv4/IPv6 address (default 127.0.0.1 or first positional)
-  --max-width <pixels>     Maximum frame width (default 1280)
-  --max-height <pixels>    Maximum frame height (default 720)
+  --max-width <pixels>     Maximum frame width (default 960)
+  --max-height <pixels>    Maximum frame height (default 540)
   --max-fps <fps>          Target frames per second (default 30.0)
   --jpeg-quality <1-100>   JPEG quality percentage (default 60)
   --verbose / -v           Enable verbose logging (can also set VM_VERBOSE=1)

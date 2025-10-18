@@ -31,14 +31,21 @@ struct ReceiverApp {
     height: u32,
     frame_dirty: bool,
     verbose: bool,
+    locked_size: Option<(u32, u32)>,
 }
 
 const MAX_PENDING_FRAMES: u32 = 16;
+const DEFAULT_WINDOW_WIDTH: u32 = 960;
+const DEFAULT_WINDOW_HEIGHT: u32 = 540;
 
 impl ReceiverApp {
     fn new(socket: UdpSocket) -> Self {
-        let window_attributes =
-            Window::default_attributes().with_title("Rust Screen Mirror Receiver");
+        let window_attributes = Window::default_attributes()
+            .with_title("Rust Screen Mirror Receiver")
+            .with_inner_size(LogicalSize::new(
+                DEFAULT_WINDOW_WIDTH as f64,
+                DEFAULT_WINDOW_HEIGHT as f64,
+            ));
         Self {
             socket,
             frames: HashMap::new(),
@@ -47,10 +54,11 @@ impl ReceiverApp {
             window: None,
             render_target: None,
             current_image: None,
-            width: 800,
-            height: 600,
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
             frame_dirty: false,
             verbose: env::var("VM_VERBOSE").map(|v| v != "0").unwrap_or(false),
+            locked_size: Some((DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)),
         }
     }
 
@@ -73,6 +81,7 @@ impl ReceiverApp {
                                 self.current_image = Some(vec![0xFF_00_0000; placeholder_len]);
                                 self.frame_dirty = true;
                             }
+                            self.locked_size = Some((self.width, self.height));
                             let _ = window_rc.request_inner_size(LogicalSize::new(
                                 self.width as f64,
                                 self.height as f64,
@@ -180,9 +189,13 @@ impl ReceiverApp {
 
         if decoder.read_image(&mut raw).is_ok() {
             if let Some(pixels) = convert_to_pixels(&raw, color_type) {
-                let size_changed = self.width != img_width || self.height != img_height;
+                let new_size = (img_width, img_height);
+                let size_changed = self.locked_size.map_or(true, |size| size != new_size);
                 self.width = img_width;
                 self.height = img_height;
+                if size_changed {
+                    self.locked_size = Some(new_size);
+                }
                 self.current_image = Some(pixels);
                 self.frame_dirty = true;
                 if self.verbose {
@@ -216,6 +229,14 @@ impl ReceiverApp {
         let window_size = window.inner_size();
         if window_size.width == 0 || window_size.height == 0 {
             return;
+        }
+        if let Some((locked_w, locked_h)) = self.locked_size {
+            if window_size.width != locked_w || window_size.height != locked_h {
+                let logical_size = LogicalSize::new(locked_w as f64, locked_h as f64);
+                let _ = window.request_inner_size(logical_size);
+                window.request_redraw();
+                return;
+            }
         }
         let Some(width_nz) = NonZeroU32::new(window_size.width) else {
             return;
@@ -314,7 +335,17 @@ impl ApplicationHandler<()> for ReceiverApp {
         }
 
         match event {
-            WindowEvent::Resized(_size) => {
+            WindowEvent::Resized(size) => {
+                if let Some((locked_w, locked_h)) = self.locked_size {
+                    if size.width != locked_w || size.height != locked_h {
+                        let logical_size = LogicalSize::new(locked_w as f64, locked_h as f64);
+                        let _ = window.request_inner_size(logical_size);
+                    }
+                } else {
+                    self.locked_size = Some((size.width, size.height));
+                    self.width = size.width;
+                    self.height = size.height;
+                }
                 self.frame_dirty = true;
                 window.request_redraw();
             }
