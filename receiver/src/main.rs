@@ -3,6 +3,7 @@ use image::{ColorType, ImageDecoder};
 use softbuffer::{Context, Surface};
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::env;
 use std::io::Cursor;
 use std::net::UdpSocket;
 use std::num::NonZeroU32;
@@ -29,6 +30,7 @@ struct ReceiverApp {
     width: u32,
     height: u32,
     frame_dirty: bool,
+    verbose: bool,
 }
 
 impl ReceiverApp {
@@ -46,6 +48,7 @@ impl ReceiverApp {
             width: 800,
             height: 600,
             frame_dirty: false,
+            verbose: env::var("VM_VERBOSE").map(|v| v != "0").unwrap_or(false),
         }
     }
 
@@ -111,12 +114,14 @@ impl ReceiverApp {
             frame.chunks.insert(chunk_index, data.to_vec());
             let stored_chunks = frame.chunks.len();
 
-            println!(
-                "Frame {frame_id}: stored chunk {chunk_index}/{} (have {stored_chunks}/{total_chunks})",
-                total_chunks.saturating_sub(1)
-            );
+            if self.verbose {
+                println!(
+                    "Frame {frame_id}: stored chunk {chunk_index}/{} (have {stored_chunks}/{total_chunks})",
+                    total_chunks.saturating_sub(1)
+                );
+            }
 
-            if stored_chunks == 1 {
+            if stored_chunks == 1 && self.verbose {
                 println!(
                     "Started frame {frame_id} (expecting {total_chunks} chunks, first chunk {chunk_index})"
                 );
@@ -133,11 +138,13 @@ impl ReceiverApp {
                         );
                     }
                 }
-                println!(
-                    "Frame {frame_id} assembled with {} chunks ({} bytes total)",
-                    frame.total_chunks,
-                    jpeg_data.len()
-                );
+                if self.verbose {
+                    println!(
+                        "Frame {frame_id} assembled with {} chunks ({} bytes total)",
+                        frame.total_chunks,
+                        jpeg_data.len()
+                    );
+                }
 
                 if let Ok(decoder) = JpegDecoder::new(Cursor::new(jpeg_data)) {
                     self.handle_decoded_frame(decoder);
@@ -161,14 +168,19 @@ impl ReceiverApp {
 
         if decoder.read_image(&mut raw).is_ok() {
             if let Some(pixels) = convert_to_pixels(&raw, color_type) {
+                let size_changed = self.width != img_width || self.height != img_height;
                 self.width = img_width;
                 self.height = img_height;
                 self.current_image = Some(pixels);
                 self.frame_dirty = true;
-                println!("Decoded frame: {img_width}x{img_height} ({:?})", color_type);
+                if self.verbose {
+                    println!("Decoded frame: {img_width}x{img_height} ({:?})", color_type);
+                }
                 if let Some(window) = &self.window {
-                    let logical_size = LogicalSize::new(img_width as f64, img_height as f64);
-                    let _ = window.request_inner_size(logical_size);
+                    if size_changed {
+                        let logical_size = LogicalSize::new(img_width as f64, img_height as f64);
+                        let _ = window.request_inner_size(logical_size);
+                    }
                     window.request_redraw();
                 }
             } else {
@@ -214,25 +226,29 @@ impl ReceiverApp {
             let src_width = self.width as usize;
             let src_height = self.height as usize;
 
-            println!(
-                "Rendering frame {}x{} into buffer {}x{} (buffer len {}, pixels len {})",
-                src_width,
-                src_height,
-                dst_width,
-                dst_height,
-                buffer.len(),
-                pixels.len()
-            );
+            if self.verbose {
+                println!(
+                    "Rendering frame {}x{} into buffer {}x{} (buffer len {}, pixels len {})",
+                    src_width,
+                    src_height,
+                    dst_width,
+                    dst_height,
+                    buffer.len(),
+                    pixels.len()
+                );
+            }
 
             if buffer.len() == pixels.len() && dst_width == src_width && dst_height == src_height {
                 buffer.copy_from_slice(pixels);
             } else if src_width == 0 || src_height == 0 {
                 return;
             } else {
-                println!(
-                    "Scaling frame {}x{} -> {}x{}",
-                    src_width, src_height, dst_width, dst_height
-                );
+                if self.verbose {
+                    println!(
+                        "Scaling frame {}x{} -> {}x{}",
+                        src_width, src_height, dst_width, dst_height
+                    );
+                }
                 for y in 0..dst_height {
                     let src_y = (y * src_height) / dst_height;
                     let src_row = src_y * src_width;
@@ -245,10 +261,12 @@ impl ReceiverApp {
             }
             let _ = buffer.present();
             self.frame_dirty = false;
-            println!(
-                "Presented frame (source {}x{}, window {}x{})",
-                src_width, src_height, dst_width, dst_height
-            );
+            if self.verbose {
+                println!(
+                    "Presented frame (source {}x{}, window {}x{})",
+                    src_width, src_height, dst_width, dst_height
+                );
+            }
         }
     }
 }

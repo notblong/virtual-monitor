@@ -14,12 +14,13 @@ const CHUNK_SIZE: usize = 1_200; // keep under typical MTU to avoid fragmentatio
 const DEFAULT_MAX_FRAME_WIDTH: u32 = 1_280;
 const DEFAULT_MAX_FRAME_HEIGHT: u32 = 720;
 const DEFAULT_MAX_FPS: f32 = 30.0;
+const DEFAULT_JPEG_QUALITY: u8 = 60;
 
 fn main() {
     // Get receiver IP from args
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: sender <receiver_ip> [max_width] [max_height] [max_fps]");
+        eprintln!("Usage: sender <receiver_ip> [max_width] [max_height] [max_fps] [jpeg_quality]");
         return;
     }
     let receiver_ip = &args[1];
@@ -39,7 +40,13 @@ fn main() {
         .and_then(|arg| arg.parse::<f32>().ok())
         .filter(|&val| val > 0.0)
         .unwrap_or(DEFAULT_MAX_FPS);
+    let jpeg_quality = args
+        .get(5)
+        .and_then(|arg| arg.parse::<u8>().ok())
+        .filter(|&val| val > 0 && val <= 100)
+        .unwrap_or(DEFAULT_JPEG_QUALITY);
     let frame_interval = Duration::from_secs_f32(1.0 / max_fps);
+    let verbose = env::var("VM_VERBOSE").map(|v| v != "0").unwrap_or(false);
 
     // Create UDP socket
     let socket = UdpSocket::bind("0.0.0.0:0").expect("bind failed");
@@ -50,8 +57,14 @@ fn main() {
     // Capture main screen
     let screen = Screen::from_point(0, 0).expect("no screen found");
     println!(
-        "Streaming display {}x{} to {} (max frame size {}x{}, max {:.1} fps)",
-        screen.display_info.width, screen.display_info.height, addr, max_width, max_height, max_fps
+        "Streaming display {}x{} to {} (max frame size {}x{}, max {:.1} fps, JPEG quality {})",
+        screen.display_info.width,
+        screen.display_info.height,
+        addr,
+        max_width,
+        max_height,
+        max_fps,
+        jpeg_quality
     );
 
     let mut frame_id: u32 = 0;
@@ -89,10 +102,12 @@ fn main() {
                     let scale = scale_x.min(scale_y);
                     let target_width = (width as f32 * scale).round().max(1.0) as u32;
                     let target_height = (height as f32 * scale).round().max(1.0) as u32;
-                    println!(
-                        "Downscaling frame {frame_id} to {}x{} (scale {:.2})",
-                        target_width, target_height, scale
-                    );
+                    if verbose {
+                        println!(
+                            "Downscaling frame {frame_id} to {}x{} (scale {:.2})",
+                            target_width, target_height, scale
+                        );
+                    }
                     let resized = image::imageops::resize(
                         &rgb_image,
                         target_width,
@@ -108,7 +123,7 @@ fn main() {
             let mut jpeg_bytes = Vec::new();
             {
                 let mut cursor = Cursor::new(&mut jpeg_bytes);
-                let mut encoder = JpegEncoder::new_with_quality(&mut cursor, 70);
+                let mut encoder = JpegEncoder::new_with_quality(&mut cursor, jpeg_quality);
                 encoder
                     .encode(
                         &frame_pixels,
@@ -121,12 +136,14 @@ fn main() {
 
             // Split into chunks
             let total_chunks = ((jpeg_bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u16;
-            println!(
-                "Prepared frame {frame_id}: {}x{} -> {} bytes across {total_chunks} chunks",
-                frame_width,
-                frame_height,
-                jpeg_bytes.len()
-            );
+            if verbose {
+                println!(
+                    "Prepared frame {frame_id}: {}x{} -> {} bytes across {total_chunks} chunks",
+                    frame_width,
+                    frame_height,
+                    jpeg_bytes.len()
+                );
+            }
             for i in 0..total_chunks {
                 let start_i = i as usize * CHUNK_SIZE;
                 let end_i = std::cmp::min(start_i + CHUNK_SIZE, jpeg_bytes.len());
