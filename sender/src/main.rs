@@ -15,38 +15,177 @@ const DEFAULT_MAX_FRAME_WIDTH: u32 = 1_280;
 const DEFAULT_MAX_FRAME_HEIGHT: u32 = 720;
 const DEFAULT_MAX_FPS: f32 = 30.0;
 const DEFAULT_JPEG_QUALITY: u8 = 60;
+const DEFAULT_RECEIVER_IP: &str = "127.0.0.1";
+const USAGE: &str = "\
+Usage: sender [options] [receiver_ip]
+
+Options:
+  --receiver <ip>          Receiver IPv4/IPv6 address (default 127.0.0.1 or first positional)
+  --max-width <pixels>     Maximum frame width (default 1280)
+  --max-height <pixels>    Maximum frame height (default 720)
+  --max-fps <fps>          Target frames per second (default 30.0)
+  --jpeg-quality <1-100>   JPEG quality percentage (default 60)
+  --verbose / -v           Enable verbose logging (can also set VM_VERBOSE=1)
+  --no-verbose             Disable verbose logging
+  --help                   Show this message
+
+Examples:
+  cargo run --release -- --receiver 192.168.1.50 --max-width 1600 --max-fps 45
+  cargo run --release -- --jpeg-quality 30
+";
+
+struct SenderConfig {
+    receiver: String,
+    max_width: u32,
+    max_height: u32,
+    max_fps: f32,
+    jpeg_quality: u8,
+    verbose: bool,
+}
+
+impl SenderConfig {
+    fn from_env() -> Result<Self, String> {
+        let mut receiver: Option<String> = None;
+        let mut max_width: Option<u32> = None;
+        let mut max_height: Option<u32> = None;
+        let mut max_fps: Option<f32> = None;
+        let mut jpeg_quality: Option<u8> = None;
+        let mut verbose = env::var("VM_VERBOSE").map(|v| v != "0").unwrap_or(false);
+        let mut positional: Vec<String> = Vec::new();
+
+        let raw_args: Vec<String> = env::args().skip(1).collect();
+        let mut i = 0;
+        while i < raw_args.len() {
+            let arg = &raw_args[i];
+            if let Some(flag) = arg.strip_prefix("--") {
+                match flag {
+                    "receiver" | "receiver-ip" | "ip" => {
+                        i += 1;
+                        let value = raw_args
+                            .get(i)
+                            .ok_or_else(|| format!("Expected value after --{flag}"))?
+                            .clone();
+                        receiver = Some(value);
+                    }
+                    "max-width" | "width" => {
+                        i += 1;
+                        let value = raw_args
+                            .get(i)
+                            .ok_or_else(|| format!("Expected value after --{flag}"))?;
+                        let parsed = value
+                            .parse::<u32>()
+                            .map_err(|_| format!("Invalid integer for --{flag}: {value}"))?;
+                        if parsed == 0 {
+                            return Err(format!("--{flag} must be greater than zero"));
+                        }
+                        max_width = Some(parsed);
+                    }
+                    "max-height" | "height" => {
+                        i += 1;
+                        let value = raw_args
+                            .get(i)
+                            .ok_or_else(|| format!("Expected value after --{flag}"))?;
+                        let parsed = value
+                            .parse::<u32>()
+                            .map_err(|_| format!("Invalid integer for --{flag}: {value}"))?;
+                        if parsed == 0 {
+                            return Err(format!("--{flag} must be greater than zero"));
+                        }
+                        max_height = Some(parsed);
+                    }
+                    "max-fps" | "fps" => {
+                        i += 1;
+                        let value = raw_args
+                            .get(i)
+                            .ok_or_else(|| format!("Expected value after --{flag}"))?;
+                        let fps = value
+                            .parse::<f32>()
+                            .map_err(|_| format!("Invalid float for --{flag}: {value}"))?;
+                        if fps <= 0.0 {
+                            return Err(format!("--{flag} must be greater than zero"));
+                        }
+                        max_fps = Some(fps);
+                    }
+                    "jpeg-quality" | "jpeg_quality" | "quality" => {
+                        i += 1;
+                        let value = raw_args
+                            .get(i)
+                            .ok_or_else(|| format!("Expected value after --{flag}"))?;
+                        let quality = value
+                            .parse::<u8>()
+                            .map_err(|_| format!("Invalid integer for --{flag}: {value}"))?;
+                        if quality == 0 || quality > 100 {
+                            return Err("--jpeg-quality must be between 1 and 100".to_string());
+                        }
+                        jpeg_quality = Some(quality);
+                    }
+                    "verbose" => {
+                        verbose = true;
+                    }
+                    "no-verbose" => {
+                        verbose = false;
+                    }
+                    "help" => {
+                        print_usage();
+                        return Err(String::new());
+                    }
+                    other => {
+                        return Err(format!("Unknown flag '--{other}'\n{USAGE}"));
+                    }
+                }
+            } else if arg == "-v" {
+                verbose = true;
+            } else if arg == "-q" {
+                verbose = false;
+            } else if arg == "-h" {
+                print_usage();
+                return Err(String::new());
+            } else {
+                positional.push(arg.clone());
+            }
+            i += 1;
+        }
+
+        if receiver.is_none() {
+            if let Some(pos0) = positional.first() {
+                receiver = Some(pos0.clone());
+            }
+        }
+
+        let receiver = receiver.unwrap_or_else(|| DEFAULT_RECEIVER_IP.to_string());
+
+        Ok(Self {
+            receiver,
+            max_width: max_width.unwrap_or(DEFAULT_MAX_FRAME_WIDTH),
+            max_height: max_height.unwrap_or(DEFAULT_MAX_FRAME_HEIGHT),
+            max_fps: max_fps.unwrap_or(DEFAULT_MAX_FPS),
+            jpeg_quality: jpeg_quality.unwrap_or(DEFAULT_JPEG_QUALITY),
+            verbose,
+        })
+    }
+}
+
+fn print_usage() {
+    println!("{USAGE}");
+}
 
 fn main() {
-    // Get receiver IP from args
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: sender <receiver_ip> [max_width] [max_height] [max_fps] [jpeg_quality]");
-        return;
-    }
-    let receiver_ip = &args[1];
-    let addr = format!("{}:5000", receiver_ip);
-    let max_width = args
-        .get(2)
-        .and_then(|arg| arg.parse::<u32>().ok())
-        .filter(|&val| val > 0)
-        .unwrap_or(DEFAULT_MAX_FRAME_WIDTH);
-    let max_height = args
-        .get(3)
-        .and_then(|arg| arg.parse::<u32>().ok())
-        .filter(|&val| val > 0)
-        .unwrap_or(DEFAULT_MAX_FRAME_HEIGHT);
-    let max_fps = args
-        .get(4)
-        .and_then(|arg| arg.parse::<f32>().ok())
-        .filter(|&val| val > 0.0)
-        .unwrap_or(DEFAULT_MAX_FPS);
-    let jpeg_quality = args
-        .get(5)
-        .and_then(|arg| arg.parse::<u8>().ok())
-        .filter(|&val| val > 0 && val <= 100)
-        .unwrap_or(DEFAULT_JPEG_QUALITY);
-    let frame_interval = Duration::from_secs_f32(1.0 / max_fps);
-    let verbose = env::var("VM_VERBOSE").map(|v| v != "0").unwrap_or(false);
+    let config = match SenderConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(err) if err.is_empty() => return,
+        Err(err) => {
+            eprintln!("{err}");
+            print_usage();
+            return;
+        }
+    };
+    let addr = format!("{}:5000", config.receiver);
+    let frame_interval = Duration::from_secs_f32(1.0 / config.max_fps);
+    let verbose = config.verbose;
+    let max_width = config.max_width;
+    let max_height = config.max_height;
+    let max_fps = config.max_fps;
+    let jpeg_quality = config.jpeg_quality;
 
     // Create UDP socket
     let socket = UdpSocket::bind("0.0.0.0:0").expect("bind failed");
