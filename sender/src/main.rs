@@ -11,14 +11,15 @@ use std::{
 };
 
 const CHUNK_SIZE: usize = 1_200; // keep under typical MTU to avoid fragmentation
-const MAX_FRAME_WIDTH: u32 = 1_280;
-const MAX_FRAME_HEIGHT: u32 = 720;
+const DEFAULT_MAX_FRAME_WIDTH: u32 = 1_280;
+const DEFAULT_MAX_FRAME_HEIGHT: u32 = 720;
+const DEFAULT_MAX_FPS: f32 = 30.0;
 
 fn main() {
     // Get receiver IP from args
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: sender <receiver_ip> [max_width] [max_height]");
+        eprintln!("Usage: sender <receiver_ip> [max_width] [max_height] [max_fps]");
         return;
     }
     let receiver_ip = &args[1];
@@ -27,12 +28,18 @@ fn main() {
         .get(2)
         .and_then(|arg| arg.parse::<u32>().ok())
         .filter(|&val| val > 0)
-        .unwrap_or(MAX_FRAME_WIDTH);
+        .unwrap_or(DEFAULT_MAX_FRAME_WIDTH);
     let max_height = args
         .get(3)
         .and_then(|arg| arg.parse::<u32>().ok())
         .filter(|&val| val > 0)
-        .unwrap_or(MAX_FRAME_HEIGHT);
+        .unwrap_or(DEFAULT_MAX_FRAME_HEIGHT);
+    let max_fps = args
+        .get(4)
+        .and_then(|arg| arg.parse::<f32>().ok())
+        .filter(|&val| val > 0.0)
+        .unwrap_or(DEFAULT_MAX_FPS);
+    let frame_interval = Duration::from_secs_f32(1.0 / max_fps);
 
     // Create UDP socket
     let socket = UdpSocket::bind("0.0.0.0:0").expect("bind failed");
@@ -43,8 +50,8 @@ fn main() {
     // Capture main screen
     let screen = Screen::from_point(0, 0).expect("no screen found");
     println!(
-        "Streaming display {}x{} to {} (max frame size {}x{})",
-        screen.display_info.width, screen.display_info.height, addr, max_width, max_height
+        "Streaming display {}x{} to {} (max frame size {}x{}, max {:.1} fps)",
+        screen.display_info.width, screen.display_info.height, addr, max_width, max_height, max_fps
     );
 
     let mut frame_id: u32 = 0;
@@ -138,10 +145,10 @@ fn main() {
             frame_id = frame_id.wrapping_add(1);
         }
 
-        // Control FPS (~10–15 fps)
+        // Throttle to configured FPS.
         let elapsed = start.elapsed();
-        if elapsed < Duration::from_millis(100) {
-            thread::sleep(Duration::from_millis(100) - elapsed);
+        if elapsed < frame_interval {
+            thread::sleep(frame_interval - elapsed);
         }
     }
 }
