@@ -1,28 +1,24 @@
 use image::codecs::jpeg::JpegDecoder;
 use image::{ColorType, ImageDecoder};
+use quinn::{Endpoint, ServerConfig};
+use rcgen::{Certificate as RcgenCertificate, CertificateParams, DistinguishedName};
+use rustls::{Certificate as RustlsCertificate, PrivateKey as RustlsPrivateKey};
 use softbuffer::{Context, Surface};
-use std::collections::HashMap;
-use std::convert::TryInto;
 use std::env;
 use std::io::Cursor;
-use std::net::UdpSocket;
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::Arc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-struct FrameBuffer {
-    chunks: HashMap<u16, Vec<u8>>,
-    total_chunks: u16,
-}
-
 struct ReceiverApp {
-    socket: UdpSocket,
-    frames: HashMap<u32, FrameBuffer>,
-    buf: [u8; 65_507],
+    frame_rx: UnboundedReceiver<Vec<u8>>,
     window_attributes: WindowAttributes,
     window: Option<Rc<Window>>,
     render_target: Option<(Context<Rc<Window>>, Surface<Rc<Window>, Rc<Window>>)>,
@@ -34,12 +30,11 @@ struct ReceiverApp {
     locked_size: Option<(u32, u32)>,
 }
 
-const MAX_PENDING_FRAMES: u32 = 16;
 const DEFAULT_WINDOW_WIDTH: u32 = 960;
 const DEFAULT_WINDOW_HEIGHT: u32 = 540;
 
 impl ReceiverApp {
-    fn new(socket: UdpSocket) -> Self {
+    fn new(frame_rx: UnboundedReceiver<Vec<u8>>) -> Self {
         let window_attributes = Window::default_attributes()
             .with_title("Rust Screen Mirror Receiver")
             .with_inner_size(LogicalSize::new(
@@ -47,9 +42,7 @@ impl ReceiverApp {
                 DEFAULT_WINDOW_HEIGHT as f64,
             ));
         Self {
-            socket,
-            frames: HashMap::new(),
-            buf: [0u8; 65_507],
+            frame_rx,
             window_attributes,
             window: None,
             render_target: None,
@@ -106,76 +99,25 @@ impl ReceiverApp {
         }
     }
 
-    fn drain_socket(&mut self) {
-        while let Ok((len, _src)) = self.socket.recv_from(&mut self.buf) {
-            if len < 8 {
-                eprintln!("Discarded packet smaller than header (len={len})");
-                continue;
-            }
-
-            let frame_id = u32::from_be_bytes(self.buf[0..4].try_into().unwrap());
-            let chunk_index = u16::from_be_bytes(self.buf[4..6].try_into().unwrap());
-            let total_chunks = u16::from_be_bytes(self.buf[6..8].try_into().unwrap());
-            let data = &self.buf[8..len];
-
-            let frame = self.frames.entry(frame_id).or_insert_with(|| FrameBuffer {
-                chunks: HashMap::new(),
-                total_chunks,
-            });
-            frame.chunks.insert(chunk_index, data.to_vec());
-            let stored_chunks = frame.chunks.len();
-
-            if self.verbose {
-                println!(
-                    "Frame {frame_id}: stored chunk {chunk_index}/{} (have {stored_chunks}/{total_chunks})",
-                    total_chunks.saturating_sub(1)
-                );
-            }
-
-            if stored_chunks == 1 && self.verbose {
-                println!(
-                    "Started frame {frame_id} (expecting {total_chunks} chunks, first chunk {chunk_index})"
-                );
-            }
-
-            if stored_chunks as u16 == frame.total_chunks {
-                let mut jpeg_data = Vec::new();
-                for i in 0..frame.total_chunks {
-                    if let Some(chunk) = frame.chunks.get(&i) {
-                        jpeg_data.extend_from_slice(chunk);
-                    } else {
-                        eprintln!(
-                            "Frame {frame_id} missing chunk {i}, assembled data may be incomplete"
-                        );
-                    }
+    fn drain_frames(&mut self) {
+        use tokio::sync::mpsc::error::TryRecvError;
+        loop {
+            match self.frame_rx.try_recv() {
+                Ok(data) => self.process_frame(data),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    eprintln!("Frame stream disconnected");
+                    break;
                 }
-                if self.verbose {
-                    println!(
-                        "Frame {frame_id} assembled with {} chunks ({} bytes total)",
-                        frame.total_chunks,
-                        jpeg_data.len()
-                    );
-                }
-
-                if let Ok(decoder) = JpegDecoder::new(Cursor::new(jpeg_data)) {
-                    self.handle_decoded_frame(decoder);
-                } else {
-                    eprintln!("Failed to create JPEG decoder for frame {frame_id}");
-                }
-
-                self.frames.remove(&frame_id);
-                self.prune_old_frames(frame_id);
             }
-            self.prune_old_frames(frame_id);
         }
     }
 
-    fn prune_old_frames(&mut self, latest_id: u32) {
-        let threshold = latest_id.saturating_sub(MAX_PENDING_FRAMES);
-        if self.frames.len() as u32 <= MAX_PENDING_FRAMES {
-            return;
+    fn process_frame(&mut self, data: Vec<u8>) {
+        match JpegDecoder::new(Cursor::new(data)) {
+            Ok(decoder) => self.handle_decoded_frame(decoder),
+            Err(err) => eprintln!("Failed to create JPEG decoder: {err}"),
         }
-        self.frames.retain(|&id, _| id >= threshold);
     }
 
     fn handle_decoded_frame<D>(&mut self, decoder: D)
@@ -310,12 +252,12 @@ impl ApplicationHandler<()> for ReceiverApp {
             event_loop.set_control_flow(ControlFlow::Poll);
             self.ensure_window(event_loop);
         }
-        self.drain_socket();
+        self.drain_frames();
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.ensure_window(event_loop);
-        self.drain_socket();
+        self.drain_frames();
     }
 
     fn window_event(
@@ -324,7 +266,7 @@ impl ApplicationHandler<()> for ReceiverApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        self.drain_socket();
+        self.drain_frames();
 
         let Some(window) = &self.window else {
             return;
@@ -356,7 +298,7 @@ impl ApplicationHandler<()> for ReceiverApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        self.drain_socket();
+        self.drain_frames();
         if self.frame_dirty {
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -366,16 +308,112 @@ impl ApplicationHandler<()> for ReceiverApp {
 }
 
 fn main() {
-    let socket = UdpSocket::bind("0.0.0.0:5000").expect("bind failed");
-    socket
-        .set_nonblocking(true)
-        .expect("failed to set nonblocking");
-    println!("Listening on UDP port 5000...");
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_quic_server(frame_tx);
+    println!("Listening for QUIC connections on 0.0.0.0:5000...");
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = ReceiverApp::new(socket);
+    let mut app = ReceiverApp::new(frame_rx);
 
     event_loop.run_app(&mut app).expect("event loop run failed");
+}
+
+fn spawn_quic_server(frame_tx: UnboundedSender<Vec<u8>>) {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async move {
+            if let Err(err) = run_quic_server(frame_tx).await {
+                eprintln!("QUIC server error: {err}");
+            }
+        });
+    });
+}
+
+async fn run_quic_server(
+    frame_tx: UnboundedSender<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr: SocketAddr = "0.0.0.0:5000".parse()?;
+    let server_config = make_server_config()?;
+    let endpoint = Endpoint::server(server_config, addr)?;
+
+    while let Some(connecting) = endpoint.accept().await {
+        let tx_cloned = frame_tx.clone();
+        tokio::spawn(async move {
+            match connecting.await {
+                Ok(connection) => {
+                    if let Err(err) = handle_connection(connection, tx_cloned).await {
+                        eprintln!("Connection error: {err}");
+                    }
+                }
+                Err(err) => eprintln!("Incoming connection failed: {err}"),
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn handle_connection(
+    connection: quinn::Connection,
+    frame_tx: UnboundedSender<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        match connection.accept_uni().await {
+            Ok(recv) => {
+                let tx = frame_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = process_stream(recv, tx).await {
+                        eprintln!("Stream handling error: {err}");
+                    }
+                });
+            }
+            Err(quinn::ConnectionError::ApplicationClosed { .. }) => break,
+            Err(err) => {
+                eprintln!("Failed to accept stream: {err}");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn process_stream(
+    mut recv: quinn::RecvStream,
+    frame_tx: UnboundedSender<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+    let mut data = vec![0u8; frame_len];
+    recv.read_exact(&mut data).await?;
+    if frame_tx.send(data).is_err() {
+        eprintln!("Receiver window dropped frame channel");
+    }
+    Ok(())
+}
+
+fn make_server_config() -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let cert = generate_self_signed_cert()?;
+    let mut server_config = ServerConfig::with_single_cert(cert.0, cert.1)?;
+    Arc::get_mut(&mut server_config.transport)
+        .expect("transport config not shared")
+        .max_concurrent_uni_streams(1024_u32.into());
+    Ok(server_config)
+}
+
+fn generate_self_signed_cert(
+) -> Result<(Vec<rustls::Certificate>, rustls::PrivateKey), Box<dyn std::error::Error + Send + Sync>>
+{
+    let mut params = CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]);
+    let mut dn = DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "virtual-monitor");
+    params.distinguished_name = dn;
+    let cert = RcgenCertificate::from_params(params)?;
+    let cert_der = cert.serialize_der()?;
+    let key_der = cert.serialize_private_key_der();
+    let cert_chain = vec![RustlsCertificate(cert_der)];
+    let priv_key = RustlsPrivateKey(key_der);
+    Ok((cert_chain, priv_key))
 }
 
 fn convert_to_pixels(raw: &[u8], color_type: ColorType) -> Option<Vec<u32>> {

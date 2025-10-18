@@ -7,3 +7,7 @@ edition = "2021"
 image = "0.25"
 winit = "0.30"
 softbuffer = "0.4"
+quinn = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
+rcgen = "0.11"
+rustls = "0.21"

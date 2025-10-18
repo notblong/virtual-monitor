@@ -1,16 +1,20 @@
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{ColorType, RgbImage};
+use quinn::{ClientConfig, Endpoint};
+use rustls::client::{
+    ClientConfig as RustlsClientConfig, ServerCertVerified, ServerCertVerifier, ServerName,
+};
+use rustls::Error as RustlsError;
 use screenshots::Screen;
 use std::io::Cursor;
-use std::{
-    env,
-    net::UdpSocket,
-    thread,
-    time::{Duration, Instant},
-};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+use std::{env, error::Error};
+use tokio::task;
+use tokio::time::sleep;
 
-const CHUNK_SIZE: usize = 1_200; // keep under typical MTU to avoid fragmentation
 const DEFAULT_MAX_FRAME_WIDTH: u32 = 960;
 const DEFAULT_MAX_FRAME_HEIGHT: u32 = 540;
 const DEFAULT_MAX_FPS: f32 = 30.0;
@@ -26,14 +30,15 @@ Options:
   --max-fps <fps>          Target frames per second (default 30.0)
   --jpeg-quality <1-100>   JPEG quality percentage (default 60)
   --verbose / -v           Enable verbose logging (can also set VM_VERBOSE=1)
-  --no-verbose             Disable verbose logging
-  --help                   Show this message
+  --no-verbose / -q        Disable verbose logging
+  --help / -h              Show this message
 
 Examples:
   cargo run --release -- --receiver 192.168.1.50 --max-width 1600 --max-fps 45
   cargo run --release -- --jpeg-quality 30
 ";
 
+#[derive(Clone)]
 struct SenderConfig {
     receiver: String,
     max_width: u32,
@@ -169,7 +174,8 @@ fn print_usage() {
     println!("{USAGE}");
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let config = match SenderConfig::from_env() {
         Ok(cfg) => cfg,
         Err(err) if err.is_empty() => return,
@@ -179,132 +185,178 @@ fn main() {
             return;
         }
     };
-    let addr = format!("{}:5000", config.receiver);
+
+    let server_addr: SocketAddr = format!("{}:5000", config.receiver)
+        .parse()
+        .expect("invalid receiver address");
     let frame_interval = Duration::from_secs_f32(1.0 / config.max_fps);
-    let verbose = config.verbose;
-    let max_width = config.max_width;
-    let max_height = config.max_height;
-    let max_fps = config.max_fps;
-    let jpeg_quality = config.jpeg_quality;
+    let config = Arc::new(config);
 
-    // Create UDP socket
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("bind failed");
-    socket
-        .set_nonblocking(false)
-        .expect("cannot set blocking mode");
-
-    // Capture main screen
-    let screen = Screen::from_point(0, 0).expect("no screen found");
+    let info_screen = Screen::from_point(0, 0).expect("no screen found");
     println!(
         "Streaming display {}x{} to {} (max frame size {}x{}, max {:.1} fps, JPEG quality {})",
-        screen.display_info.width,
-        screen.display_info.height,
-        addr,
-        max_width,
-        max_height,
-        max_fps,
-        jpeg_quality
+        info_screen.display_info.width,
+        info_screen.display_info.height,
+        server_addr,
+        config.max_width,
+        config.max_height,
+        config.max_fps,
+        config.jpeg_quality
     );
+    let mut endpoint =
+        Endpoint::client("0.0.0.0:0".parse().unwrap()).expect("failed to create client endpoint");
+    endpoint.set_default_client_config(make_client_config());
+
+    let connecting = endpoint
+        .connect(server_addr, "virtual-monitor")
+        .expect("connect request failed");
+    let connection = connecting
+        .await
+        .expect("failed to establish QUIC connection");
+    println!("Connected to {server_addr}");
 
     let mut frame_id: u32 = 0;
-
     loop {
         let start = Instant::now();
-        if let Ok(capture) = screen.capture() {
-            let width = capture.width();
-            let height = capture.height();
+        let cfg = Arc::clone(&config);
+        let current_frame = frame_id;
+        frame_id = frame_id.wrapping_add(1);
 
-            // JPEG encoder only supports RGB input, so drop alpha channel from RGBA buffer.
-            let rgba = capture.rgba();
-            let mut rgb_buffer = Vec::with_capacity((width as usize) * (height as usize) * 3);
-            for pixel in rgba.chunks_exact(4) {
-                rgb_buffer.push(pixel[0]); // R
-                rgb_buffer.push(pixel[1]); // G
-                rgb_buffer.push(pixel[2]); // B
-            }
-            let rgb_image = match RgbImage::from_raw(width, height, rgb_buffer) {
-                Some(img) => img,
-                None => {
-                    eprintln!(
-                        "Failed to build RGB image for frame {frame_id} ({}x{})",
-                        width, height
+        let capture_result = task::spawn_blocking(move || capture_frame(&cfg, current_frame))
+            .await
+            .unwrap();
+
+        match capture_result {
+            Ok(frame) => {
+                if let Err(err) = send_frame(&connection, &frame).await {
+                    eprintln!("Failed to send frame {current_frame}: {err}");
+                } else if config.verbose {
+                    println!(
+                        "Sent frame {current_frame}: {}x{} ({} bytes)",
+                        frame.width,
+                        frame.height,
+                        frame.bytes.len()
                     );
-                    continue;
                 }
-            };
-
-            // Downscale if needed to stay within max dimensions.
-            let (frame_width, frame_height, frame_pixels) =
-                if width > max_width || height > max_height {
-                    let scale_x = max_width as f32 / width as f32;
-                    let scale_y = max_height as f32 / height as f32;
-                    let scale = scale_x.min(scale_y);
-                    let target_width = (width as f32 * scale).round().max(1.0) as u32;
-                    let target_height = (height as f32 * scale).round().max(1.0) as u32;
-                    if verbose {
-                        println!(
-                            "Downscaling frame {frame_id} to {}x{} (scale {:.2})",
-                            target_width, target_height, scale
-                        );
-                    }
-                    let resized = image::imageops::resize(
-                        &rgb_image,
-                        target_width,
-                        target_height,
-                        FilterType::Triangle,
-                    );
-                    (target_width, target_height, resized.into_raw())
-                } else {
-                    (width, height, rgb_image.into_raw())
-                };
-
-            // Encode to JPEG in-memory
-            let mut jpeg_bytes = Vec::new();
-            {
-                let mut cursor = Cursor::new(&mut jpeg_bytes);
-                let mut encoder = JpegEncoder::new_with_quality(&mut cursor, jpeg_quality);
-                encoder
-                    .encode(
-                        &frame_pixels,
-                        frame_width,
-                        frame_height,
-                        ColorType::Rgb8.into(),
-                    )
-                    .expect("JPEG encode failed");
             }
-
-            // Split into chunks
-            let total_chunks = ((jpeg_bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u16;
-            if verbose {
-                println!(
-                    "Prepared frame {frame_id}: {}x{} -> {} bytes across {total_chunks} chunks",
-                    frame_width,
-                    frame_height,
-                    jpeg_bytes.len()
-                );
+            Err(err) => {
+                eprintln!("Capture failed: {err}");
             }
-            for i in 0..total_chunks {
-                let start_i = i as usize * CHUNK_SIZE;
-                let end_i = std::cmp::min(start_i + CHUNK_SIZE, jpeg_bytes.len());
-                let chunk = &jpeg_bytes[start_i..end_i];
-
-                // Build packet: [frame_id (4 bytes)] [chunk_index (2 bytes)] [total_chunks (2 bytes)] [data...]
-                let mut packet = Vec::with_capacity(8 + chunk.len());
-                packet.extend_from_slice(&frame_id.to_be_bytes());
-                packet.extend_from_slice(&(i as u16).to_be_bytes());
-                packet.extend_from_slice(&total_chunks.to_be_bytes());
-                packet.extend_from_slice(chunk);
-
-                socket.send_to(&packet, &addr).ok();
-            }
-
-            frame_id = frame_id.wrapping_add(1);
         }
 
-        // Throttle to configured FPS.
         let elapsed = start.elapsed();
         if elapsed < frame_interval {
-            thread::sleep(frame_interval - elapsed);
+            sleep(frame_interval - elapsed).await;
         }
     }
+}
+
+struct FrameData {
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+fn capture_frame(
+    config: &SenderConfig,
+    frame_id: u32,
+) -> Result<FrameData, Box<dyn Error + Send + Sync>> {
+    let screen = Screen::from_point(0, 0).map_err(|err| format!("screen error: {err}"))?;
+    let capture = screen
+        .capture()
+        .map_err(|err| format!("capture failed: {err}"))?;
+    let width = capture.width();
+    let height = capture.height();
+
+    let rgba = capture.rgba();
+    let mut rgb_buffer = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for pixel in rgba.chunks_exact(4) {
+        rgb_buffer.push(pixel[0]);
+        rgb_buffer.push(pixel[1]);
+        rgb_buffer.push(pixel[2]);
+    }
+
+    let rgb_image = RgbImage::from_raw(width, height, rgb_buffer).ok_or_else(|| {
+        format!("Failed to build RGB image for frame {frame_id} ({width}x{height})")
+    })?;
+
+    let (frame_width, frame_height, frame_pixels) =
+        if width > config.max_width || height > config.max_height {
+            let scale_x = config.max_width as f32 / width as f32;
+            let scale_y = config.max_height as f32 / height as f32;
+            let scale = scale_x.min(scale_y);
+            let target_width = (width as f32 * scale).round().max(1.0) as u32;
+            let target_height = (height as f32 * scale).round().max(1.0) as u32;
+            if config.verbose {
+                println!(
+                    "Downscaling frame {frame_id} to {}x{} (scale {:.2})",
+                    target_width, target_height, scale
+                );
+            }
+            let resized = image::imageops::resize(
+                &rgb_image,
+                target_width,
+                target_height,
+                FilterType::Triangle,
+            );
+            (target_width, target_height, resized.into_raw())
+        } else {
+            (width, height, rgb_image.into_raw())
+        };
+
+    let mut jpeg_bytes = Vec::new();
+    {
+        let mut cursor = Cursor::new(&mut jpeg_bytes);
+        let mut encoder = JpegEncoder::new_with_quality(&mut cursor, config.jpeg_quality);
+        encoder
+            .encode(
+                &frame_pixels,
+                frame_width,
+                frame_height,
+                ColorType::Rgb8.into(),
+            )
+            .map_err(|err| format!("JPEG encode failed: {err}"))?;
+    }
+
+    Ok(FrameData {
+        bytes: jpeg_bytes,
+        width: frame_width,
+        height: frame_height,
+    })
+}
+
+async fn send_frame(
+    connection: &quinn::Connection,
+    frame: &FrameData,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut stream = connection.open_uni().await?;
+    let frame_len = frame.bytes.len() as u32;
+    stream.write_all(&frame_len.to_be_bytes()).await?;
+    stream.write_all(&frame.bytes).await?;
+    stream.finish().await?;
+    Ok(())
+}
+
+fn make_client_config() -> ClientConfig {
+    struct SkipServerVerification;
+
+    impl ServerCertVerifier for SkipServerVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::Certificate,
+            _intermediates: &[rustls::Certificate],
+            _server_name: &ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp: &[u8],
+            _now: SystemTime,
+        ) -> Result<ServerCertVerified, RustlsError> {
+            Ok(ServerCertVerified::assertion())
+        }
+    }
+
+    let crypto = RustlsClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+    ClientConfig::new(Arc::new(crypto))
 }
