@@ -33,6 +33,8 @@ struct ReceiverApp {
     verbose: bool,
 }
 
+const MAX_PENDING_FRAMES: u32 = 16;
+
 impl ReceiverApp {
     fn new(socket: UdpSocket) -> Self {
         let window_attributes =
@@ -153,8 +155,18 @@ impl ReceiverApp {
                 }
 
                 self.frames.remove(&frame_id);
+                self.prune_old_frames(frame_id);
             }
+            self.prune_old_frames(frame_id);
         }
+    }
+
+    fn prune_old_frames(&mut self, latest_id: u32) {
+        let threshold = latest_id.saturating_sub(MAX_PENDING_FRAMES);
+        if self.frames.len() as u32 <= MAX_PENDING_FRAMES {
+            return;
+        }
+        self.frames.retain(|&id, _| id >= threshold);
     }
 
     fn handle_decoded_frame<D>(&mut self, decoder: D)
