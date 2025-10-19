@@ -144,10 +144,6 @@ impl ReceiverApp {
                     println!("Decoded frame: {img_width}x{img_height} ({:?})", color_type);
                 }
                 if let Some(window) = &self.window {
-                    if size_changed {
-                        let logical_size = LogicalSize::new(img_width as f64, img_height as f64);
-                        let _ = window.request_inner_size(logical_size);
-                    }
                     window.request_redraw();
                 }
             } else {
@@ -171,14 +167,6 @@ impl ReceiverApp {
         let window_size = window.inner_size();
         if window_size.width == 0 || window_size.height == 0 {
             return;
-        }
-        if let Some((locked_w, locked_h)) = self.locked_size {
-            if window_size.width != locked_w || window_size.height != locked_h {
-                let logical_size = LogicalSize::new(locked_w as f64, locked_h as f64);
-                let _ = window.request_inner_size(logical_size);
-                window.request_redraw();
-                return;
-            }
         }
         let Some(width_nz) = NonZeroU32::new(window_size.width) else {
             return;
